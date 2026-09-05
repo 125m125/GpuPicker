@@ -12,6 +12,7 @@ This folder is the repository root. Local state in `data/` is ignored by Git and
 - **Unassigned** leaves the app untouched, including any existing Windows preference.
 - **Sync** saves the choices in the grid, refreshes the snapshot and app list, and applies saved rules.
 - **Add .exe** includes an application that is not currently running or whose process path could not be read.
+- **Edit rule** lets you replace part of the executable's immediate parent folder with `*` (for example `MyApp\version-*\app.exe`). The installation root and executable name stay fixed. Select an app row, edit its rule, then **Preview matches** and **Save rule**. The rule must still match the reference executable, and all current matches are shown before saving. Packaged-app IDs cannot be edited.
 - Restart an affected app yourself after changing its preference. GPU Picker never terminates apps.
 - Double-click **Sync quietly.vbs** to run once without a window. Unknown apps are saved for review but never assigned automatically.
 - Opening a second instance focuses the existing window when possible. Headless sync skips while the UI or another sync holds the store open.
@@ -26,7 +27,7 @@ Saved choices from earlier versions labeled AMD integrated or NVIDIA are automat
 
 `data/apps.json` contains the current app list and choices, not usage history. `apps.json.bak` is the previous saved list. Original registry values are retained in `data/original-preferences.json` before the first change to each path. An exclusive file handle prevents two instances from modifying storage together.
 
-Discord, Discord Canary and Discord PTB version folders are resolved automatically inside their respective installation folders. Other applications use their exact executable path; add them again if their location changes. Old Windows entries are left in place rather than deleting settings belonging to older installations.
+Discord, Discord Canary and Discord PTB version folders are resolved automatically inside their respective installation folders. Other applications start with their exact executable path. Use **Edit rule** for version-folder updates; future matching versions receive the saved preference during sync. Rules cannot overlap another existing app row, and wildcard expansion skips linked version folders. Saving a rule does not immediately apply GPU preferences; **Save & apply**, **Sync**, or scheduled sync applies it. Old Windows entries are left in place rather than deleting settings belonging to older installations.
 
 ## Optional daily sync
 

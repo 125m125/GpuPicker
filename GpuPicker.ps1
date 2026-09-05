@@ -2,24 +2,67 @@ param([switch]$Headless, [switch]$LibraryOnly, [switch]$SmokeTest,
       [string]$DataDirectory = "$PSScriptRoot\data")
 $ErrorActionPreference = 'Stop'
 
-function Get-AppRule([string]$Path) {
+function Get-AppRule([string]$Path, [object[]]$Apps = @()) {
+    foreach ($app in $Apps) {
+        if (Test-AppRuleMatch $app.Rule $Path) { return $app.Rule }
+    }
     # Only known Squirrel installations get automatic version-folder matching.
     if ($Path -match '(?i)\\(Discord(?:Canary|PTB)?)\\app-[^\\]+\\Discord(?:Canary|PTB)?\.exe$') {
         return ($Path -replace '\\app-[^\\]+\\', '\app-*\')
     }
     return $Path
 }
+function Test-AppRuleMatch([string]$Rule, [string]$Path) {
+    $pattern = '^' + [regex]::Escape($Rule).Replace('\*', '[^\\]*') + '$'
+    return $Path -match $pattern
+}
 function Resolve-AppRule([string]$Rule) {
     if ($Rule -match '^[^\\:]+![^\\]+$') { return $Rule }
-    if ($Rule.Contains('\app-*\')) {
-        $parts = $Rule -split [regex]::Escape('\app-*\'), 2
-        if (Test-Path -LiteralPath $parts[0]) {
-            Get-ChildItem -LiteralPath $parts[0] -Directory -Filter 'app-*' | ForEach-Object {
-                $candidate = Join-Path $_.FullName $parts[1]
+    if ($Rule.Contains('*')) {
+        $folder = [IO.Path]::GetDirectoryName($Rule)
+        $root = [IO.Path]::GetDirectoryName($folder)
+        $leaf = [IO.Path]::GetFileName($Rule)
+        # Only the immediate parent folder can contain stars. Never recurse.
+        if ($root.Contains('*') -or $leaf.Contains('*')) { throw 'Wildcards are allowed only in the immediate parent folder.' }
+        if (Test-Path -LiteralPath $root -PathType Container) {
+            Get-ChildItem -LiteralPath $root -Directory | Where-Object {
+                !($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+                (Test-AppRuleMatch $folder $_.FullName)
+            } | ForEach-Object {
+                $candidate = Join-Path $_.FullName $leaf
                 if (Test-Path -LiteralPath $candidate -PathType Leaf) { $candidate }
             }
         }
     } elseif (Test-Path -LiteralPath $Rule -PathType Leaf) { $Rule }
+}
+function Get-RulePreview([string]$Rule, [string]$CurrentPath, [object[]]$Apps, [string]$OriginalRule) {
+    if (![IO.Path]::IsPathRooted($CurrentPath) -or
+        [IO.Path]::GetExtension($CurrentPath) -ne '.exe' -or
+        !(Test-Path -LiteralPath $CurrentPath -PathType Leaf)) {
+        throw 'Select an installed desktop executable. Packaged-app IDs cannot be edited.'
+    }
+    $folder = [IO.Path]::GetDirectoryName($CurrentPath)
+    $root = [IO.Path]::GetDirectoryName($folder)
+    $candidateFolder = [IO.Path]::GetDirectoryName($Rule)
+    if (!$root -or !$candidateFolder -or
+        [IO.Path]::GetDirectoryName($candidateFolder) -ne $root -or
+        [IO.Path]::GetFileName($Rule) -ne [IO.Path]::GetFileName($CurrentPath)) {
+        throw 'Keep the installation root and executable name unchanged. Edit only the immediate parent folder.'
+    }
+    $segment = [IO.Path]::GetFileName($candidateFolder)
+    if ($segment -in @('.','..') -or $segment -match '[?\[\]<>:"/|]' -or $segment.EndsWith('.') -or $segment.EndsWith(' ')) {
+        throw 'Use only * as a wildcard in the parent folder; other wildcard syntax and relative paths are not allowed.'
+    }
+    if (!(Test-AppRuleMatch $Rule $CurrentPath)) { throw 'The rule must still match the reference executable.' }
+    $paths = @(Resolve-AppRule $Rule | Sort-Object -Unique)
+    if ($paths -notcontains $CurrentPath) { throw 'The rule must resolve to the reference executable. Linked version folders are not expanded.' }
+    foreach ($app in $Apps) {
+        if ($app.Rule -eq $OriginalRule) { continue }
+        foreach ($path in $paths) {
+            if (Test-AppRuleMatch $app.Rule $path) { throw 'This rule overlaps another app row. Keep separate rules to avoid conflicting preferences.' }
+        }
+    }
+    return $paths
 }
 function Convert-PreferenceChoice([string]$Choice) {
     # Keep inventories saved by earlier versions compatible with the generic labels.
@@ -99,7 +142,7 @@ function Discover-Apps {
     # Import Windows entries even if the application is not running.
     foreach ($name in $script:windowsPreferences.Keys) {
         if ($script:windowsPreferences[$name] -notmatch '(?:GpuPreference|SpecificAdapter)=') { continue }
-        $rule = Get-AppRule $name
+        $rule = Get-AppRule $name $script:apps
         $existing = @($script:apps | Where-Object Rule -eq $rule)
         if (!$existing.Count) {
             $displayName = [IO.Path]::GetFileNameWithoutExtension($name)
@@ -133,7 +176,7 @@ function Discover-Apps {
         if (!$path) { $inaccessible++; continue }
         # Keep the list focused on user applications, not protected Windows services.
         if ($path.StartsWith($env:windir + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
-        $rule = Get-AppRule $path
+        $rule = Get-AppRule $path $script:apps
         if ($script:packageKeys.ContainsKey($path)) {
             $packageRule = $script:packageKeys[$path]
             # Replace a previous path-only row with the stable packaged app identity.
@@ -147,6 +190,7 @@ function Discover-Apps {
         }
         if (!$script:running.ContainsKey($rule)) { $script:running[$rule] = @{ Count=0; MiB=0.0; HasMemory=$false } }
         $script:running[$rule].Count++
+        $script:running[$rule].Path = $path
         if ($script:memory.ContainsKey($p.Id)) {
             $script:running[$rule].MiB += $script:memory[$p.Id]
             $script:running[$rule].HasMemory = $true
@@ -161,7 +205,7 @@ function Discover-Apps {
     }
     foreach ($app in $script:apps) {
         $labels = @(foreach ($name in $script:windowsPreferences.Keys) {
-            if ((Get-AppRule $name) -eq $app.Rule) { Get-PreferenceLabel $script:windowsPreferences[$name] }
+            if (Test-AppRuleMatch $app.Rule $name) { Get-PreferenceLabel $script:windowsPreferences[$name] }
         }) | Select-Object -Unique
         $current = 'Windows decides'
         if (@($labels).Count -eq 1) { $current = [string]$labels }
@@ -238,7 +282,8 @@ try {
     $sync = New-Object Windows.Forms.Button; $sync.Text = 'Sync'; $sync.Width = 100
     $save = New-Object Windows.Forms.Button; $save.Text = 'Save && apply'; $save.Width = 130
     $add = New-Object Windows.Forms.Button; $add.Text = 'Add .exe'; $add.Width = 100
-    $top.Controls.AddRange(@($sync,$save,$add))
+    $edit = New-Object Windows.Forms.Button; $edit.Text = 'Edit rule'; $edit.Width = 100
+    $top.Controls.AddRange(@($sync,$save,$add,$edit))
     $info = New-Object Windows.Forms.Label
     $info.Dock = 'Top'; $info.Height = 62; $info.Padding = New-Object Windows.Forms.Padding(8)
     $status = New-Object Windows.Forms.Label
@@ -287,7 +332,7 @@ try {
         $dialog = New-Object Windows.Forms.OpenFileDialog; $dialog.Filter = 'Applications (*.exe)|*.exe'
         if ($dialog.ShowDialog() -eq 'OK') { Ui-Action {
             Capture-Choices
-            $rule = Get-AppRule $dialog.FileName
+            $rule = Get-AppRule $dialog.FileName $script:apps
             if (!@($script:apps | Where-Object Rule -eq $rule).Count) {
                 $script:apps += [pscustomobject]@{Name=[IO.Path]::GetFileNameWithoutExtension($dialog.FileName);Rule=$rule;Choice='Unassigned'}
             }
@@ -295,6 +340,77 @@ try {
         } }
         $dialog.Dispose()
     })
+    function Edit-AppRule($app) {
+        if ($app.Rule -match '^[^\\:]+![^\\]+$') { throw 'Packaged-app IDs are stable and cannot use wildcard rules.' }
+        $current = $null
+        if ($script:running[$app.Rule]) { $current = $script:running[$app.Rule].Path }
+        if (!$current) { $current = @(Resolve-AppRule $app.Rule | Sort-Object)[0] }
+        if (!$current) { throw 'No installed executable matches this row. Add the current .exe first.' }
+        $originalRule = $app.Rule
+        $editor = New-Object Windows.Forms.Form
+        $editor.Text = 'Edit rule - ' + $app.Name
+        $editor.ClientSize = New-Object Drawing.Size(780,440)
+        $editor.MinimumSize = New-Object Drawing.Size(640,440)
+        $editor.StartPosition = 'CenterParent'
+        $editor.Font = $form.Font
+        $help = New-Object Windows.Forms.Label
+        $help.SetBounds(12,12,756,62); $help.Anchor = 'Top,Left,Right'
+        $help.Text = 'Use * in the immediate parent folder (for example version-*). Keep the folder above it and the .exe name fixed. Preview all matches before saving. Future matching versions will also receive this preference.'
+        $reference = New-Object Windows.Forms.TextBox
+        $reference.SetBounds(12,80,756,26); $reference.Anchor = 'Top,Left,Right'; $reference.ReadOnly = $true
+        $reference.Text = $current
+        $reference.AccessibleName = 'Reference executable that the rule must still match'
+        $ruleInput = New-Object Windows.Forms.TextBox
+        $ruleInput.SetBounds(12,118,756,26); $ruleInput.Anchor = 'Top,Left,Right'; $ruleInput.Text = $app.Rule
+        $ruleInput.AccessibleName = 'Executable rule'
+        $preview = New-Object Windows.Forms.TextBox
+        $preview.SetBounds(12,158,756,222); $preview.Anchor = 'Top,Bottom,Left,Right'
+        $preview.Multiline = $true; $preview.ReadOnly = $true; $preview.ScrollBars = 'Both'; $preview.WordWrap = $false
+        $preview.AccessibleName = 'Matching executables'
+        $preview.Text = 'Select Preview matches to validate the rule and list every current match.'
+        $check = New-Object Windows.Forms.Button
+        $check.Text = 'Preview matches'; $check.SetBounds(12,396,155,30); $check.Anchor = 'Bottom,Left'
+        $accept = New-Object Windows.Forms.Button
+        $accept.Text = 'Save rule'; $accept.SetBounds(550,396,105,30); $accept.Anchor = 'Bottom,Right'; $accept.Enabled = $false
+        $cancel = New-Object Windows.Forms.Button
+        $cancel.Text = 'Cancel'; $cancel.SetBounds(663,396,105,30); $cancel.Anchor = 'Bottom,Right'
+        $cancel.DialogResult = 'Cancel'; $editor.CancelButton = $cancel
+        $ruleInput.Add_TextChanged({ $accept.Enabled = $false; $preview.Text = 'Rule changed. Preview matches again before saving.' })
+        $check.Add_Click({
+            $accept.Enabled = $false
+            try {
+                $paths = @(Get-RulePreview $ruleInput.Text $current $script:apps $originalRule)
+                $preview.Text = ($paths -join [Environment]::NewLine)
+                $accept.Enabled = $true
+            } catch { $preview.Text = $_.Exception.Message }
+        })
+        $accept.Add_Click({
+            try {
+                $paths = @(Get-RulePreview $ruleInput.Text $current $script:apps $originalRule)
+                $latest = $paths -join [Environment]::NewLine
+                if ($latest -ne $preview.Text) {
+                    $preview.Text = $latest
+                    throw 'Matches changed since preview. Review the updated list, then save again.'
+                }
+                $app.Rule = $ruleInput.Text
+                try { Save-Apps } catch { $app.Rule = $originalRule; throw }
+                $editor.DialogResult = 'OK'
+                $editor.Close()
+            } catch { [void][Windows.Forms.MessageBox]::Show($editor,$_.Exception.Message,'Rule not saved') }
+        })
+        $editor.Controls.AddRange(@($help,$reference,$ruleInput,$preview,$check,$accept,$cancel))
+        try {
+            if ($editor.ShowDialog($form) -eq 'OK') {
+                Discover-Apps; Fill-Grid
+                $status.Text = 'Rule saved. Use Save & apply or Sync to apply it now; scheduled sync will also use it.'
+            }
+        } finally { $editor.Dispose() }
+    }
+    $edit.Add_Click({ Ui-Action {
+        if (!$grid.CurrentRow) { throw 'Select an app row first.' }
+        Capture-Choices
+        Edit-AppRule $grid.CurrentRow.Tag
+    } })
     $form.Controls.AddRange(@($grid,$info,$top,$status))
     $form.Add_Shown({ Ui-Action { Discover-Apps; Fill-Grid }; if ($SmokeTest) { $form.Close() } })
     [void]$form.ShowDialog()

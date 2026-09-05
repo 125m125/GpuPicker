@@ -25,6 +25,27 @@ try {
  Assert ($rule -eq "$root\Discord\app-*\Discord.exe") 'Discord version must be generalized'
  Assert (@(Resolve-AppRule $rule).Count -eq 2) 'Both installed versions must resolve'
  Assert ((Get-AppRule "$root\Other\v1\other.exe") -eq "$root\Other\v1\other.exe") 'Do not broaden arbitrary applications'
+
+ # Custom version-folder rules must stay scoped to the selected installation.
+ New-Item "$root\Other\version-1","$root\Other\version-2","$root\Other\nested\version-3" -ItemType Directory -Force | Out-Null
+ New-Item "$root\Other\version-1\other.exe","$root\Other\version-2\other.exe","$root\Other\nested\version-3\other.exe" -ItemType File | Out-Null
+ $current = "$root\Other\version-1\other.exe"
+ $custom = "$root\Other\version-*\other.exe"
+ Assert (@(Get-RulePreview $custom $current @() $current).Count -eq 2) 'Preview only direct matching version folders'
+ Assert (@(Resolve-AppRule $custom).Count -eq 2) 'Custom rule resolves all installed versions'
+ $savedApps = @([pscustomobject]@{Rule=$custom;Choice='High performance'})
+ Assert ((Get-AppRule "$root\Other\version-2\other.exe" $savedApps) -eq $custom) 'Discovery reuses a saved custom rule'
+ Assert (Test-AppRuleMatch $custom "$root\Other\version-2\other.exe") 'Registry entries match the custom rule'
+ Assert (!(Test-AppRuleMatch $custom "$root\Other\nested\version-3\other.exe")) 'Star cannot cross folder boundaries'
+ foreach ($bad in @("$root\*\version-1\other.exe", "$root\Other\version-*\*.exe", "$root\Other\version-?\other.exe", "$root\Other\missing-*\other.exe", "$root\Other\..\other.exe", 'Package_123!App')) {
+  $rejected = $false
+  try { Get-RulePreview $bad $current @() $current | Out-Null } catch { $rejected = $true }
+  Assert $rejected "Reject unsafe or nonmatching rule: $bad"
+ }
+ $rejected = $false
+ try { Get-RulePreview $custom $current @([pscustomobject]@{Rule="$root\Other\version-2\other.exe"}) $current | Out-Null } catch { $rejected = $true }
+ Assert $rejected 'Reject overlap with another managed row'
+
  # Exercise the real apply routine against an in-memory registry, never user preferences.
  $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\GpuPicker.ps1",[ref]$null,[ref]$null)
  $definition = $ast.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Apply-Apps'},$true)
@@ -36,10 +57,10 @@ try {
  function New-Item { param($Path,[switch]$Force) }
  function New-ItemProperty { param($Path,$Name,$Value,$PropertyType,[switch]$Force) $script:fake[$Name]=$Value }
  function Remove-ItemProperty { param($Path,$Name,$ErrorAction) $script:fake.Remove($Name) }
- $script:apps = @([pscustomobject]@{Rule=$rule;Choice='Power saving'})
- $first = "$root\Discord\app-1.0\Discord.exe"
+ $script:apps = @([pscustomobject]@{Rule=$custom;Choice='Power saving'})
+ $first = $current
  $script:fake[$first] = 'AutoHDREnable=1;GpuPreference=2;'
- Assert ((Apply-Apps) -eq 2) 'Apply both Discord versions'
+ Assert ((Apply-Apps) -eq 2) 'Apply both custom-rule versions'
  Assert ($script:fake[$first] -eq 'AutoHDREnable=1;GpuPreference=1;') 'Keep HDR setting'
  Assert ((Apply-Apps) -eq 0) 'Second apply must be idempotent'
  $script:apps[0].Choice = 'Windows decides'
@@ -49,6 +70,33 @@ try {
  $backup = @($loaded)
  Assert ($backup.Count -eq 2) 'Backup each path only once'
  Assert (($backup | Where-Object Path -eq $first).Value -eq 'AutoHDREnable=1;GpuPreference=2;') 'Retain original preference'
+
+ # Exercise discovery with two running versions and two existing Windows entries.
+ $definition = $ast.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Discover-Apps'},$true)
+ Invoke-Expression $definition.Extent.Text
+ $script:registry = $root
+ $second = "$root\Other\version-2\other.exe"
+ $script:fake = @{}
+ $script:fake[$current] = 'GpuPreference=2;'
+ $script:fake[$second] = 'GpuPreference=2;'
+ $registryKey = New-Object PSObject
+ $registryKey | Add-Member ScriptMethod GetValueNames { return @($script:fake.Keys) }
+ $registryKey | Add-Member ScriptMethod GetValue { param($name) return $script:fake[$name] }
+ function Get-Item { return $registryKey }
+ function Get-AppxPackage { }
+ function Get-Command { throw 'No NVIDIA snapshot in this test' }
+ function Get-Counter { throw 'No GPU counters in this test' }
+ function Get-Process {
+  [pscustomobject]@{Path=$current;ProcessName='other';Id=101}
+  [pscustomobject]@{Path=$second;ProcessName='other';Id=102}
+ }
+ function Save-Apps { }
+ $script:apps = @([pscustomobject]@{Name='Other';Rule=$custom;Choice='High performance'})
+ Discover-Apps
+ Assert ($script:apps.Count -eq 1) 'Sync must not recreate rows for versions covered by a custom rule'
+ Assert ($script:running[$custom].Count -eq 2) 'Both running versions belong to the custom row'
+ Assert ($script:apps[0].WindowsSetting -eq 'High performance') 'Windows assignments are aggregated through the custom rule'
+
 } finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
 
 
