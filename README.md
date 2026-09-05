@@ -52,3 +52,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\Test.ps1'
 ```
 
 The UI and discovery can be smoke-tested with `-SmokeTest -DataDirectory <temporary-folder>`; this exits after loading the window and does not apply GPU preferences.
+
+## License and AI disclosure
+
+GPU Picker is released under the [MIT License](LICENSE).
+
+This project was developed with substantial assistance from generative AI. To the extent the contributors hold copyright in their contributions, those contributions are licensed under the MIT License. Third-party materials remain subject to their respective licenses.
