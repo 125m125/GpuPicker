@@ -1,0 +1,20 @@
+# Local app inventory, preferences, backups, and active-instance lock.
+# Contains machine-specific executable paths; recreated on first launch.
+/data/
+
+# Use this folder for custom -DataDirectory runs and development scratch files.
+/work/
+
+# Temporary files and local diagnostics.
+*.tmp
+*.bak
+*.log
+session.lock
+
+# Editor and Windows metadata.
+/.vs/
+/.idea/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
